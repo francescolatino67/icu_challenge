@@ -1,5 +1,5 @@
-#-*- coding: utf-8 -*- 
-# --- 
+#-*- coding: utf-8 -*-
+# ---
 # jupyter:
 #   jupytext:
 #     text_representation:
@@ -11,15 +11,21 @@
 #     display_name: venv (3.10.11)
 #     language: python
 #     name: python3
-# --- 
+# ---
 
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
-from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc, accuracy_score
+from sklearn.utils import resample
 
 # Define the path to the dataset
 file_path = r'c:\Users\franc\Desktop\PhD\courses\AI Methods for Bioengineering Challenges\challenge\icu_challenge\Dataset_ICU_Barbieri_Mollura.csv'
@@ -44,174 +50,144 @@ print("\n--- Column Names ---")
 print(df.columns.tolist())
 
 # 2. Find correlations between variables
+print("\n--- Correlation Analysis ---")
 plt.figure(figsize=(20, 16))
 correlation_matrix = df.corr()
 sns.heatmap(correlation_matrix, annot=False, cmap='coolwarm', linewidths=0.5)
 plt.title('Correlation Matrix of ICU Dataset Variables')
 plt.show()
 
-# Find and print highly correlated pairs
-print("Highly correlated attributes (correlation > 0.7 or < -0.7):")
-for i in range(len(correlation_matrix.columns)):
-    for j in range(i):
-        if abs(correlation_matrix.iloc[i, j]) > 0.7:
-            print(f"{correlation_matrix.columns[i]:<20} | {correlation_matrix.columns[j]:<20} | {correlation_matrix.iloc[i, j]:.2f}")
+# # Find and print highly correlated pairs
+# print("Highly correlated attributes (correlation > 0.7 or < -0.7):")
+# # Get the absolute value of the correlation matrix
+# corr_abs = correlation_matrix.abs()
+# # Get the upper triangle of the correlation matrix
+# upper_tri = corr_abs.where(pd.np.triu(pd.np.ones(corr_abs.shape), k=1).astype(pd.np.bool))
+# # Find index of feature columns with correlation greater than 0.7
+# to_drop_corr = [column for column in upper_tri.columns if any(upper_tri[column] > 0.7)]
+# # Get the pairs of highly correlated features
+# highly_correlated_pairs = []
+# for col in to_drop_corr:
+#     for row in upper_tri.index:
+#         if upper_tri.loc[row, col] > 0.7:
+#             highly_correlated_pairs.append((row, col, upper_tri.loc[row, col]))
 
-# --- Step 3: Remove Highly Correlated Variables ---
-# Based on the analysis above, we will remove variables to reduce redundancy (multicollinearity).
-# The strategy is to keep the most clinically relevant or fundamental variable in a correlated group.
+# for pair in highly_correlated_pairs:
+#     print(f"{pair[0]:<20} | {pair[1]:<20} | {pair[2]:.2f}")
 
-# Define the list of columns to remove based on our rules:
-# - Drop MAP/NIMAP in favor of Systolic/Diastolic.
-# - Drop median/last summary stats in favor of first/lowest/highest.
-# - Drop AST in favor of the more liver-specific ALT.
-# - Drop redundant Weight columns.
-# - Drop '_last' lab values in favor of '_first' (baseline).
-# - Drop redundant ventilation metric.
 
+# --- Data Preprocessing ---
 columns_to_drop = [
-    # Redundant Blood Pressure (keeping Systolic/Diastolic)
     'NIMAP_first', 'MAP_last', 'NIMAP_last', 'NIMAP_lowest', 'NIMAP_highest', 'MAP_median', 'NIMAP_median',
-    'SysABP_median', # Correlated with MAP_median
-
-    # Redundant Summary Statistics (keeping _first, _lowest, _highest)
-    'GCS_last', 'GCS_median',
-    'SaO2_last', 'SaO2_median',
-    'DiasABP_median',
-    'HR_last', 'HR_median',
-    'NISysABP_median',
-    'Temp_median', # from 'Temp_median' vs 'Temp_highest'
-
-    # Redundant Clinical Concepts
-    'AST_first', 'AST_last', # Keeping ALT
-    'Weight', 'Weight_last', # Keeping Weight_first
-
-    # Redundant Lab Tests (keeping _first)
-    'ALP_last',
-    'Albumin_last',
-    'BUN_last',
-    'Bilirubin_last',
-    'Cholesterol_last', # Also has 1.0 correlation
-    'Creatinine_last',
-    'Platelets_last',
-    'TroponinI_last',
-    'TroponinT_last',
-
-    # Redundant Ventilation
-    'MechVentLast8Hour', # Keeping MechVentDuration
+    'SysABP_median', 'GCS_last', 'GCS_median', 'SaO2_last', 'SaO2_median', 'DiasABP_median', 'HR_last', 'HR_median',
+    'NISysABP_median', 'Temp_median', 'AST_first', 'AST_last', 'Weight', 'Weight_last', 'ALP_last', 'Albumin_last',
+    'BUN_last', 'Bilirubin_last', 'Cholesterol_last', 'Creatinine_last', 'Platelets_last', 'TroponinI_last',
+    'TroponinT_last', 'MechVentLast8Hour',
 ]
-
-# Remove duplicates from the list
 columns_to_drop = sorted(list(set(columns_to_drop)))
-
-# Make sure the dataframe 'df' is available from previous cells
-if 'df' in locals() or 'df' in globals():
-    # Drop the columns
-    df_cleaned = df.drop(columns=columns_to_drop, errors='ignore')
-
-    print("Based on clinical significance and high correlation, the following variables have been removed:")
-    for col in columns_to_drop:
-        print(f"- {col}")
-
-    print(f"Original number of columns: {df.shape[1]}")
-    print(f"Number of columns removed: {len(columns_to_drop)}")
-    print(f"New number of columns: {df_cleaned.shape[1]}")
-
-    # Display the first few rows of the cleaned dataframe
-    # df_cleaned.head() # This will be the output of the cell
-else:
-    print("DataFrame 'df' not found. Please run the cell that loads the data first.")
+df_cleaned = df.drop(columns=columns_to_drop, errors='ignore')
 
 def remove_high_missing_cols(df, threshold=50):
-    """
-    Remove columns with missing values above threshold percentage.
-    Returns the cleaned dataframe.
-    """
     total = len(df)
-    cols_to_drop = []
-    
-    for col in df.columns:
-        missing = df[col].isnull().sum()
-        pct = (missing / total * 100)
-        if pct > threshold:
-            cols_to_drop.append(col)
-    
+    cols_to_drop = [col for col in df.columns if (df[col].isnull().sum() / total * 100) > threshold]
     return df.drop(columns=cols_to_drop)
 
-# Calculate missing values for each column
-total = len(df_cleaned)
-results = []
-for col in df_cleaned.columns:
-    missing = df_cleaned[col].isnull().sum()
-    pct = (missing / total * 100)
-    results.append((col, missing, pct))
-
-# Sort by percentage descending
-results.sort(key=lambda x: x[2], reverse=True)
-
-print(f'Total rows: {total}\n')
-for col, missing, pct in results:
-    print(f'{col}: {missing} ({pct:.2f}%)')
-
-# Count columns with >50% missing
-cols_over_50 = [r for r in results if r[2] > 50]
-total_cols = len(results)
-print(f'\n--- SUMMARY ---
-')
-print(f'Total columns: {total_cols}')
-print(f'Columns with >50% missing: {len(cols_over_50)} ({len(cols_over_50)/total_cols*100:.2f}%)
-')
-
-# Remove columns with >50% missing
 df_cleaned_noNANs = remove_high_missing_cols(df_cleaned)
-print(f'\nRemaining columns after removal: {len(df_cleaned_noNANs.columns)}')
 
-# Define features (X) and target (y)
 X = df_cleaned_noNANs.drop(columns=['In-hospital_death', 'recordid'])
 y = df_cleaned_noNANs['In-hospital_death']
-
-# Impute missing values with the median
 X = X.fillna(X.median())
 
-# Split the data into training and testing sets
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42, stratify=y)
 
-# Initialize and train the Decision Tree Classifier
-dt_classifier = DecisionTreeClassifier(random_state=42)
-dt_classifier.fit(X_train, y_train)
+# --- Downsample the training data ---
+train_data = pd.concat([X_train, y_train], axis=1)
+majority = train_data[train_data['In-hospital_death'] == 0]
+minority = train_data[train_data['In-hospital_death'] == 1]
+majority_downsampled = resample(majority, replace=False, n_samples=len(minority), random_state=42)
+downsampled_train_data = pd.concat([majority_downsampled, minority])
+downsampled_train_data = downsampled_train_data.sample(frac=1, random_state=42)
+X_train_balanced = downsampled_train_data.drop(columns='In-hospital_death')
+y_train_balanced = downsampled_train_data['In-hospital_death']
 
-# Make predictions on the test set
-y_pred = dt_classifier.predict(X_test)
-y_pred_proba = dt_classifier.predict_proba(X_test)[:, 1]
+# --- Feature Scaling ---
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train_balanced)
+X_test_scaled = scaler.transform(X_test)
 
-# Generate and print the confusion matrix
-conf_matrix = confusion_matrix(y_test, y_pred)
-print("Confusion Matrix:")
-print(conf_matrix)
 
-# Create a heatmap for the confusion matrix
-plt.figure(figsize=(8, 6))
-sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', xticklabels=['Predicted Not-Died', 'Predicted Died'], yticklabels=['Actual Not-Died', 'Actual Died'])
-plt.title('Confusion Matrix')
-plt.ylabel('Actual Label')
-plt.xlabel('Predicted Label')
+# --- Model Training and Evaluation ---
 
-# Classification Report (Accuracy, Precision, Recall)
-report = classification_report(y_test, y_pred, target_names=['Not-Died (0)', 'Died (1)'])
-print("\nClassification Report:")
-print(report)
+models = {
+    "Decision Tree": DecisionTreeClassifier(random_state=42),
+    "Random Forest": RandomForestClassifier(random_state=42),
+    "k-Nearest Neighbors": KNeighborsClassifier(),
+    "Gaussian Naive Bayes": GaussianNB(),
+    "Logistic Regression": LogisticRegression(random_state=42, max_iter=1000)
+}
 
-# ROC Curve and AUC
+results = {}
 
-fpr, tpr, thresholds = roc_curve(y_test, y_pred_proba)
-roc_auc = auc(fpr, tpr)
+# Train and evaluate each model
+for model_name, model in models.items():
+    print(f"\n\n-----------------------------------")
+    print(f"--- {model_name} ---")
+    print(f"-----------------------------------")
 
-plt.figure(figsize=(8, 6))
-plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
+    # Use scaled data for kNN and Logistic Regression
+    if model_name in ["k-Nearest Neighbors", "Logistic Regression"]:
+        model.fit(X_train_scaled, y_train_balanced)
+        y_pred = model.predict(X_test_scaled)
+        y_pred_proba = model.predict_proba(X_test_scaled)[:, 1]
+    else: # Use original data for tree-based models and Naive Bayes
+        model.fit(X_train_balanced, y_train_balanced)
+        y_pred = model.predict(X_test)
+        y_pred_proba = model.predict_proba(X_test)[:, 1]
+
+    # Store results
+    results[model_name] = {"y_pred": y_pred, "y_pred_proba": y_pred_proba}
+
+    # Confusion Matrix
+    conf_matrix = confusion_matrix(y_test, y_pred)
+    print(f"Confusion Matrix ({model_name}):")
+    print(conf_matrix)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', xticklabels=['Predicted Not-Died', 'Predicted Died'], yticklabels=['Actual Not-Died', 'Actual Died'])
+    plt.title(f'{model_name} - Confusion Matrix')
+    plt.show()
+
+    # Classification Report
+    report = classification_report(y_test, y_pred, target_names=['Not-Died (0)', 'Died (1)'])
+    print(f"\nClassification Report ({model_name}):")
+    print(report)
+
+    # Accuracy
+    accuracy = accuracy_score(y_test, y_pred)
+    print(f"\nAccuracy ({model_name}): {accuracy:.4f}")
+
+    # ROC Curve data
+    fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
+    roc_auc = auc(fpr, tpr)
+    results[model_name]["fpr"] = fpr
+    results[model_name]["tpr"] = tpr
+    results[model_name]["roc_auc"] = roc_auc
+
+
+# --- Combined ROC Curve ---
+print("\n\n-----------------------------------")
+print("--- Model Comparison ---")
+print("-----------------------------------")
+plt.figure(figsize=(12, 10))
+colors = {'Decision Tree': 'darkorange', 'Random Forest': 'green', 'k-Nearest Neighbors': 'purple', 'Gaussian Naive Bayes': 'red', 'Logistic Regression': 'blue'}
+
+for model_name, res in results.items():
+    plt.plot(res["fpr"], res["tpr"], color=colors[model_name], lw=2, label=f'{model_name} ROC (area = {res["roc_auc"]:.2f})')
+
 plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
 plt.xlim([0.0, 1.0])
 plt.ylim([0.0, 1.05])
 plt.xlabel('False Positive Rate')
 plt.ylabel('True Positive Rate')
-plt.title('Receiver Operating Characteristic (ROC) Curve')
+plt.title('Comparison of ROC Curves')
 plt.legend(loc="lower right")
+plt.show()
