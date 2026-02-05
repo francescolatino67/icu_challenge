@@ -1,18 +1,3 @@
-#-*- coding: utf-8 -*-
-# ---
-# jupyter:
-#   jupytext:
-#     text_representation:
-#       extension: .py
-#       format_name: light
-#       format_version: '1.5'
-#       jupytext_version: 1.16.1
-#   kernelspec:
-#     display_name: venv (3.10.11)
-#     language: python
-#     name: python3
-# ---
-
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
