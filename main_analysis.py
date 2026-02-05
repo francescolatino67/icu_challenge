@@ -16,6 +16,7 @@
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
+import numpy as np
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
@@ -24,11 +25,11 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.naive_bayes import GaussianNB
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc, accuracy_score
+from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc, accuracy_score, precision_recall_curve
 from sklearn.utils import resample
 
 # Define the path to the dataset
-file_path = r'c:\Users\franc\Desktop\PhD\courses\AI Methods for Bioengineering Challenges\challenge\icu_challenge\Dataset_ICU_Barbieri_Mollura.csv'
+file_path = r'..\icu_challenge\Dataset_ICU_Barbieri_Mollura.csv'
 
 # Load the dataset
 df = pd.read_csv(file_path)
@@ -57,25 +58,6 @@ sns.heatmap(correlation_matrix, annot=False, cmap='coolwarm', linewidths=0.5)
 plt.title('Correlation Matrix of ICU Dataset Variables')
 plt.show()
 
-# # Find and print highly correlated pairs
-# print("Highly correlated attributes (correlation > 0.7 or < -0.7):")
-# # Get the absolute value of the correlation matrix
-# corr_abs = correlation_matrix.abs()
-# # Get the upper triangle of the correlation matrix
-# upper_tri = corr_abs.where(pd.np.triu(pd.np.ones(corr_abs.shape), k=1).astype(pd.np.bool))
-# # Find index of feature columns with correlation greater than 0.7
-# to_drop_corr = [column for column in upper_tri.columns if any(upper_tri[column] > 0.7)]
-# # Get the pairs of highly correlated features
-# highly_correlated_pairs = []
-# for col in to_drop_corr:
-#     for row in upper_tri.index:
-#         if upper_tri.loc[row, col] > 0.7:
-#             highly_correlated_pairs.append((row, col, upper_tri.loc[row, col]))
-
-# for pair in highly_correlated_pairs:
-#     print(f"{pair[0]:<20} | {pair[1]:<20} | {pair[2]:.2f}")
-
-
 # --- Data Preprocessing ---
 columns_to_drop = [
     'NIMAP_first', 'MAP_last', 'NIMAP_last', 'NIMAP_lowest', 'NIMAP_highest', 'MAP_median', 'NIMAP_median',
@@ -94,39 +76,47 @@ def remove_high_missing_cols(df, threshold=50):
 
 df_cleaned_noNANs = remove_high_missing_cols(df_cleaned)
 
-X = df_cleaned_noNANs.drop(columns=['In-hospital_death', 'recordid'])
+# Define X and y
+if 'recordid' in df_cleaned_noNANs.columns:
+    X = df_cleaned_noNANs.drop(columns=['In-hospital_death', 'recordid'])
+else:
+    X = df_cleaned_noNANs.drop(columns=['In-hospital_death'])
+
 y = df_cleaned_noNANs['In-hospital_death']
+
+# Impute missing values with median
 X = X.fillna(X.median())
 
+# Feature scaling before splitting
+scaler_full = StandardScaler()
+X_scaled_full = scaler_full.fit_transform(X)
+X = pd.DataFrame(X_scaled_full, columns=X.columns)
+
+# Train-Test Split
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42, stratify=y)
 
-# --- Downsample the training data ---
-train_data = pd.concat([X_train, y_train], axis=1)
-majority = train_data[train_data['In-hospital_death'] == 0]
-minority = train_data[train_data['In-hospital_death'] == 1]
-majority_downsampled = resample(majority, replace=False, n_samples=len(minority), random_state=42)
-downsampled_train_data = pd.concat([majority_downsampled, minority])
-downsampled_train_data = downsampled_train_data.sample(frac=1, random_state=42)
-X_train_balanced = downsampled_train_data.drop(columns='In-hospital_death')
-y_train_balanced = downsampled_train_data['In-hospital_death']
-
-# --- Feature Scaling ---
-scaler = StandardScaler()
-X_train_scaled = scaler.fit_transform(X_train_balanced)
-X_test_scaled = scaler.transform(X_test)
-
+# # --- Feature Scaling ---
+# scaler = StandardScaler()
+# # Fit on the FULL training set
+# X_train_scaled = scaler.fit_transform(X_train)
+# X_test_scaled = scaler.transform(X_test)
 
 # --- Model Training and Evaluation ---
 
 models = {
-    "Decision Tree": DecisionTreeClassifier(random_state=42),
-    "Random Forest": RandomForestClassifier(random_state=42),
-    "k-Nearest Neighbors": KNeighborsClassifier(),
+    "Decision Tree": DecisionTreeClassifier(random_state=42, class_weight='balanced'),
+    "Random Forest": RandomForestClassifier(random_state=42, class_weight='balanced'),
+    "k-Nearest Neighbors": KNeighborsClassifier(), 
     "Gaussian Naive Bayes": GaussianNB(),
-    "Logistic Regression": LogisticRegression(random_state=42, max_iter=1000)
+    "Logistic Regression": LogisticRegression(random_state=42, max_iter=1000, class_weight='balanced')
 }
 
 results = {}
+
+print("\n\n=======================================================")
+print(" STARTING MODEL EVALUATION WITH THRESHOLD TUNING (F2)")
+print(" Goal: Maximize Recall (Sensitivity) to reduce False Negatives")
+print("=======================================================")
 
 # Train and evaluate each model
 for model_name, model in models.items():
@@ -134,26 +124,51 @@ for model_name, model in models.items():
     print(f"--- {model_name} ---")
     print(f"-----------------------------------")
 
-    # Use scaled data for kNN and Logistic Regression
+    # Get probabilities (positive class)
     if model_name in ["k-Nearest Neighbors", "Logistic Regression"]:
-        model.fit(X_train_scaled, y_train_balanced)
-        y_pred = model.predict(X_test_scaled)
-        y_pred_proba = model.predict_proba(X_test_scaled)[:, 1]
-    else: # Use original data for tree-based models and Naive Bayes
-        model.fit(X_train_balanced, y_train_balanced)
-        y_pred = model.predict(X_test)
+        model.fit(X_train, y_train)
+        y_pred_proba = model.predict_proba(X_test)[:, 1]
+    else: # Tree-based models and Naive Bayes
+        model.fit(X_train, y_train)
         y_pred_proba = model.predict_proba(X_test)[:, 1]
 
+    # --- Threshold Tuning Logic ---
+    # We calculate Precision, Recall, and Thresholds for the curve
+    precision, recall, thresholds = precision_recall_curve(y_test, y_pred_proba)
+    
+    # Calculate F2-Score: Weights Recall higher than Precision (Beta=2)
+    numerator = (1 + 2**2) * precision * recall
+    denominator = (2**2 * precision) + recall
+    # Handle division by zero
+    f2_scores = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator!=0)
+    
+    # Locate the index of the largest F2 score
+    # Note: precision_recall_curve appends 1.0 to precision and 0.0 to recall as the last element.
+    # thresholds array is 1 element shorter than precision/recall arrays.
+    # We ignore the last element of f2_scores for finding the max index relative to thresholds.
+    ix = np.argmax(f2_scores[:-1])
+    best_thresh = thresholds[ix]
+    best_f2 = f2_scores[ix]
+    
+    print(f"Optimal Threshold (Max F2-Score): {best_thresh:.4f}")
+    print(f"Expected F2-Score at this threshold: {best_f2:.4f}")
+
+    # Generate predictions using the NEW customized threshold
+    y_pred = (y_pred_proba >= best_thresh).astype(int)
+
     # Store results
-    results[model_name] = {"y_pred": y_pred, "y_pred_proba": y_pred_proba}
+    results[model_name] = {"y_pred": y_pred, "y_pred_proba": y_pred_proba, "roc_auc": 0} # roc_auc calc below
 
     # Confusion Matrix
     conf_matrix = confusion_matrix(y_test, y_pred)
-    print(f"Confusion Matrix ({model_name}):")
+    print(f"Confusion Matrix ({model_name}) [Tuned]:")
     print(conf_matrix)
+    
     plt.figure(figsize=(8, 6))
-    sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', xticklabels=['Predicted Not-Died', 'Predicted Died'], yticklabels=['Actual Not-Died', 'Actual Died'])
-    plt.title(f'{model_name} - Confusion Matrix')
+    sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues',
+                xticklabels=['Predicted Not-Died', 'Predicted Died'],
+                yticklabels=['Actual Not-Died', 'Actual Died'])
+    plt.title(f'{model_name} - Confusion Matrix (Threshold={best_thresh:.2f})')
     plt.show()
 
     # Classification Report
@@ -165,7 +180,7 @@ for model_name, model in models.items():
     accuracy = accuracy_score(y_test, y_pred)
     print(f"\nAccuracy ({model_name}): {accuracy:.4f}")
 
-    # ROC Curve data
+    # ROC Curve data (Standard calculation, threshold invariant)
     fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
     roc_auc = auc(fpr, tpr)
     results[model_name]["fpr"] = fpr

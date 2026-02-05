@@ -18,7 +18,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 
 # Define the path to the dataset
-file_path = r'c:\Users\franc\Desktop\PhD\courses\AI Methods for Bioengineering Challenges\challenge\icu_challenge\Dataset_ICU_Barbieri_Mollura.csv'
+file_path = r'..\icu_challenge\Dataset_ICU_Barbieri_Mollura.csv'
 
 # Load the dataset
 df = pd.read_csv(file_path)
