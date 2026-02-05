@@ -18,7 +18,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier
@@ -101,63 +101,132 @@ X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random
 # X_train_scaled = scaler.fit_transform(X_train)
 # X_test_scaled = scaler.transform(X_test)
 
-# --- Model Training and Evaluation ---
+# --- Hyperparameter Grids ---
 
-models = {
-    "Decision Tree": DecisionTreeClassifier(random_state=42, class_weight='balanced'),
-    "Random Forest": RandomForestClassifier(random_state=42, class_weight='balanced'),
-    "k-Nearest Neighbors": KNeighborsClassifier(), 
-    "Gaussian Naive Bayes": GaussianNB(),
-    "Logistic Regression": LogisticRegression(random_state=42, max_iter=1000, class_weight='balanced')
+model_params = {
+    "Decision Tree": {
+        "model": DecisionTreeClassifier(random_state=42, class_weight='balanced'),
+        "params": {
+            "max_depth": [None, 10, 20, 30],
+            "min_samples_split": [2, 5, 10, 20],
+            "min_samples_leaf": [1, 2, 5, 10],
+            "criterion": ["gini", "entropy"]
+        },
+        "requires_scale": False
+    },
+    "Random Forest": {
+        "model": RandomForestClassifier(random_state=42, class_weight='balanced'),
+        "params": {
+            "n_estimators": [100, 200, 300],
+            "max_depth": [None, 10, 20],
+            "min_samples_split": [2, 5, 10],
+            "min_samples_leaf": [1, 2, 4],
+            "bootstrap": [True, False]
+        },
+        "requires_scale": False
+    },
+    "k-Nearest Neighbors": {
+        "model": KNeighborsClassifier(),
+        "params": {
+            "n_neighbors": [3, 5, 7, 9, 11, 15],
+            "weights": ["uniform", "distance"],
+            "metric": ["euclidean", "manhattan", "minkowski"]
+        },
+        "requires_scale": True
+    },
+    "Gaussian Naive Bayes": {
+        "model": GaussianNB(),
+        "params": {
+            "var_smoothing": np.logspace(0, -9, num=100)
+        },
+        "requires_scale": False # NB handles unscaled, but often better with scaled if Gaussian assumption holds. Let's treat as unscaled for consistency with previous steps, or scaled? Usually GaussianNB is fine either way but strictly speaking assumes Gaussian distribution. Let's use unscaled as per previous logic.
+    },
+    "Logistic Regression": {
+        "model": LogisticRegression(random_state=42, max_iter=2000, class_weight='balanced'),
+        "params": {
+            "C": np.logspace(-3, 2, 10),
+            "solver": ['liblinear', 'saga'], # saga supports elasticnet/l1/l2
+            "penalty": ['l1', 'l2']
+        },
+        "requires_scale": True
+    }
 }
 
 results = {}
 
 print("\n\n=======================================================")
-print(" STARTING MODEL EVALUATION WITH THRESHOLD TUNING (F2)")
-print(" Goal: Maximize Recall (Sensitivity) to reduce False Negatives")
+print(" STARTING RANDOMIZED SEARCH CV & THRESHOLD TUNING (F2)")
+print(" Goal: 1. Optimize AUC (Hyperparams) -> 2. Maximize F2 (Threshold)")
 print("=======================================================")
 
 # Train and evaluate each model
-for model_name, model in models.items():
+for model_name, config in model_params.items():
     print(f"\n\n-----------------------------------")
     print(f"--- {model_name} ---")
     print(f"-----------------------------------")
 
-    # Get probabilities (positive class)
-    if model_name in ["k-Nearest Neighbors", "Logistic Regression"]:
-        model.fit(X_train, y_train)
-        y_pred_proba = model.predict_proba(X_test)[:, 1]
-    else: # Tree-based models and Naive Bayes
-        model.fit(X_train, y_train)
-        y_pred_proba = model.predict_proba(X_test)[:, 1]
+    model = config["model"]
+    params = config["params"]
+    requires_scale = config["requires_scale"]
 
-    # --- Threshold Tuning Logic ---
-    # We calculate Precision, Recall, and Thresholds for the curve
+    # Select correct data
+    if requires_scale:
+        X_train_curr = X_train
+        X_test_curr = X_test
+    else:
+        X_train_curr = X_train
+        X_test_curr = X_test
+
+    # 1. Randomized Search CV
+    print("Running RandomizedSearchCV...")
+    # n_iter=20 to keep runtime reasonable. Increase to 50+ for production.
+    rs = RandomizedSearchCV(
+        model, 
+        params, 
+        n_iter=20, 
+        cv=5, 
+        scoring='roc_auc', 
+        n_jobs=-1, 
+        random_state=42,
+        verbose=0
+    )
+    
+    rs.fit(X_train_curr, y_train)
+    
+    best_model = rs.best_estimator_
+    print(f"Best Parameters: {rs.best_params_}")
+    print(f"Best CV ROC-AUC: {rs.best_score_:.4f}")
+
+    # 2. Get probabilities from best model
+    y_pred_proba = best_model.predict_proba(X_test_curr)[:, 1]
+
+    # 3. Threshold Tuning (F2 Score)
     precision, recall, thresholds = precision_recall_curve(y_test, y_pred_proba)
     
-    # Calculate F2-Score: Weights Recall higher than Precision (Beta=2)
     numerator = (1 + 2**2) * precision * recall
     denominator = (2**2 * precision) + recall
-    # Handle division by zero
     f2_scores = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator!=0)
     
-    # Locate the index of the largest F2 score
-    # Note: precision_recall_curve appends 1.0 to precision and 0.0 to recall as the last element.
-    # thresholds array is 1 element shorter than precision/recall arrays.
-    # We ignore the last element of f2_scores for finding the max index relative to thresholds.
     ix = np.argmax(f2_scores[:-1])
     best_thresh = thresholds[ix]
     best_f2 = f2_scores[ix]
     
-    print(f"Optimal Threshold (Max F2-Score): {best_thresh:.4f}")
-    print(f"Expected F2-Score at this threshold: {best_f2:.4f}")
+    print(f"Optimal Threshold (Max F2): {best_thresh:.4f}")
 
-    # Generate predictions using the NEW customized threshold
+    # 4. Generate predictions
     y_pred = (y_pred_proba >= best_thresh).astype(int)
 
     # Store results
-    results[model_name] = {"y_pred": y_pred, "y_pred_proba": y_pred_proba, "roc_auc": 0} # roc_auc calc below
+    fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
+    roc_auc = auc(fpr, tpr)
+    
+    results[model_name] = {
+        "y_pred": y_pred, 
+        "y_pred_proba": y_pred_proba, 
+        "fpr": fpr, 
+        "tpr": tpr, 
+        "roc_auc": roc_auc
+    }
 
     # Confusion Matrix
     conf_matrix = confusion_matrix(y_test, y_pred)
@@ -168,7 +237,7 @@ for model_name, model in models.items():
     sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues',
                 xticklabels=['Predicted Not-Died', 'Predicted Died'],
                 yticklabels=['Actual Not-Died', 'Actual Died'])
-    plt.title(f'{model_name} - Confusion Matrix (Threshold={best_thresh:.2f})')
+    plt.title(f'{model_name} - CM (Thresh={best_thresh:.2f})')
     plt.show()
 
     # Classification Report
@@ -180,17 +249,10 @@ for model_name, model in models.items():
     accuracy = accuracy_score(y_test, y_pred)
     print(f"\nAccuracy ({model_name}): {accuracy:.4f}")
 
-    # ROC Curve data (Standard calculation, threshold invariant)
-    fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
-    roc_auc = auc(fpr, tpr)
-    results[model_name]["fpr"] = fpr
-    results[model_name]["tpr"] = tpr
-    results[model_name]["roc_auc"] = roc_auc
-
 
 # --- Combined ROC Curve ---
 print("\n\n-----------------------------------")
-print("--- Model Comparison ---")
+print("--- Model Comparison (Optimized) ---")
 print("-----------------------------------")
 plt.figure(figsize=(12, 10))
 colors = {'Decision Tree': 'darkorange', 'Random Forest': 'green', 'k-Nearest Neighbors': 'purple', 'Gaussian Naive Bayes': 'red', 'Logistic Regression': 'blue'}
@@ -203,6 +265,6 @@ plt.xlim([0.0, 1.0])
 plt.ylim([0.0, 1.05])
 plt.xlabel('False Positive Rate')
 plt.ylabel('True Positive Rate')
-plt.title('Comparison of ROC Curves')
+plt.title('Comparison of ROC Curves (Post-Tuning)')
 plt.legend(loc="lower right")
 plt.show()
