@@ -5,6 +5,9 @@ Decision Tree,Recall,0.5617529880478087
 Random Forest,Accuracy,0.7811111111111111
 Random Forest,Precision,0.29971988795518206
 Random Forest,Recall,0.4262948207171315
+k-Nearest Neighbors,Accuracy,0.8583333333333333
+k-Nearest Neighbors,Precision,0.3
+k-Nearest Neighbors,Recall,0.01195219123505976
 Hist Gradient Boosting,Accuracy,0.6733333333333333
 Hist Gradient Boosting,Precision,0.24508320726172467
 Hist Gradient Boosting,Recall,0.6454183266932271

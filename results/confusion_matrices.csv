@@ -1,0 +1,12 @@
+Model,Phase,TN,FP,FN,TP
+Decision Tree,Phase 1,1033,516,110,141
+Random Forest,Phase 1,1299,250,144,107
+k-Nearest Neighbors,Phase 1,1542,7,248,3
+Hist Gradient Boosting,Phase 1,1050,499,89,162
+Logistic Regression,Phase 1,1031,518,85,166
+Baseline (Median),Phase 2,956,593,64,187
+BayesianRidge,Phase 2,671,878,36,215
+DecisionTree,Phase 2,552,997,25,226
+RandomForest,Phase 2,661,888,38,213
+ExtraTrees,Phase 2,541,1008,24,227
+KNN,Phase 2,844,705,58,193

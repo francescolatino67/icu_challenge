@@ -33,6 +33,11 @@ except FileNotFoundError:
     print(f"Error: File '{FILE_PATH}' not found.")
     exit()
 
+# Structure to hold ROC data for exporting
+all_roc_data = []
+# Structure to hold Confusion Matrix data for exporting
+all_cm_data = []
+
 # ==============================================================================
 # 1. DATA PREPROCESSING & CLINICAL FILTERING
 # ==============================================================================
@@ -67,17 +72,26 @@ if 'GCS_first' in df_triage.columns:
 # E. Correlation Analysis & Pruning
 print("\n[2] Computing Correlation Matrix...")
 X_temp = df_triage.drop(columns=['In-hospital_death'])
-corr_matrix = X_temp.corr().abs()
 
-# PLOT 1: Correlation Matrix (Before Pruning)
+# Select only float columns (exclude binary/uint8 OHE columns and integers if strictly requested)
+# Usually Vitals are floats. GCS OHE are uint8.
+float_cols = X_temp.select_dtypes(include=['float64', 'float32']).columns
+print(f"Calculating correlation on {len(float_cols)} float variables (excluding GCS categories)...")
+
+corr_matrix = X_temp[float_cols].corr().abs()
+
+# Save Correlation Matrix to CSV
+corr_matrix.to_csv(os.path.join(RESULTS_DIR, 'correlation_matrix_pre_pruning.csv'))
+
+# PLOT 1: Correlation Matrix
 plt.figure(figsize=(16, 12))
 sns.heatmap(corr_matrix, annot=False, cmap='coolwarm', linewidths=0.5)
-plt.title('Correlation Matrix (Triage Variables - Before Pruning)')
+plt.title('Correlation Matrix (Continuous Triage Variables Only)')
 plt.tight_layout()
-plt.savefig(os.path.join(RESULTS_DIR, 'correlation_matrix_pre_pruning.png')) # Save plot
+plt.savefig(os.path.join(RESULTS_DIR, 'correlation_matrix_pre_pruning.png')) 
 plt.show()
 
-# Pruning > 0.95
+# Pruning
 print("Pruning High Correlations (>0.95)...")
 upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
 to_drop = [column for column in upper.columns if any(upper[column] > 0.95)]
@@ -124,6 +138,17 @@ model_configs = {
             "classifier__min_samples_leaf": [1, 4]
         }
     },
+    "k-Nearest Neighbors": {
+        "model": Pipeline([
+            ('imputer', SimpleImputer(strategy='median', add_indicator=True)),
+            ('scaler', StandardScaler()), 
+            ('classifier', KNeighborsClassifier())
+        ]),
+        "params": {
+            "classifier__n_neighbors": [5, 9, 15],
+            "classifier__weights": ['uniform', 'distance']
+        }
+    },
     "Hist Gradient Boosting": {
         "model": Pipeline([
             ('imputer', SimpleImputer(strategy='median', add_indicator=True)),
@@ -153,6 +178,9 @@ best_model_estimator = None
 phase1_metrics_data = [] # To store dicts for DataFrame
 phase1_roc_data = {}
 
+# Dictionary to store fitted baseline models for confusion matrices later
+fitted_baseline_models = {}
+
 # Hyperparameter Tuning Loop
 for name, config in model_configs.items():
     print(f"Tuning {name}...")
@@ -180,6 +208,24 @@ for name, config in model_configs.items():
     # Save ROC Data
     fpr, tpr, _ = roc_curve(y_test, y_prob)
     phase1_roc_data[name] = (fpr, tpr, auc_score)
+
+    # SAVE ROC DATA TO LIST
+    roc_df = pd.DataFrame({'FPR': fpr, 'TPR': tpr})
+    roc_df['Model'] = name
+    roc_df['Phase'] = 'Phase 1'
+    roc_df['AUC'] = auc_score
+    all_roc_data.append(roc_df)
+
+    # Store fitted model
+    fitted_baseline_models[name] = rs.best_estimator_
+    
+    # Save Confusion Matrix Data
+    tn, fp, fn, tp = confusion_matrix(y_test, y_pred).ravel()
+    all_cm_data.append({
+        'Model': name,
+        'Phase': 'Phase 1',
+        'TN': tn, 'FP': fp, 'FN': fn, 'TP': tp
+    })
     
     print(f"  -> Best AUC: {auc_score:.4f} | Recall: {rec_score:.4f} | Accuracy: {acc_score:.4f}")
     
@@ -289,12 +335,32 @@ def get_metrics_tuned(pipeline, X, y):
         "auc": roc_auc_score(y, y_prob),
         "recall": recall_score(y, y_pred),
         "accuracy": accuracy_score(y, y_pred),
-        "y_prob": y_prob
+        "y_prob": y_prob,
+        "y_pred": y_pred
     }
 
 base_stats = get_metrics_tuned(best_model_estimator, X_test, y_test)
 imputation_results["Baseline (Median)"] = base_stats
 # Note: Baseline Median imputation MAE/R2 is not calculated via iterative logic, but we can impute median for plot
+
+# SAVE BASELINE CM DATA
+tn, fp, fn, tp = confusion_matrix(y_test, base_stats['y_pred']).ravel()
+all_cm_data.append({
+    'Model': "Baseline (Median)",
+    'Phase': 'Phase 2',
+    'TN': tn, 'FP': fp, 'FN': fn, 'TP': tp
+})
+
+# SAVE BASELINE ROC DATA
+roc_df = pd.DataFrame()
+fpr, tpr, _ = roc_curve(y_test, base_stats['y_prob'])
+roc_df['FPR'] = fpr
+roc_df['TPR'] = tpr
+roc_df['Model'] = "Baseline (Median)"
+roc_df['Phase'] = 'Phase 2'
+roc_df['AUC'] = base_stats['auc']
+all_roc_data.append(roc_df)
+
 imp_median = SimpleImputer(strategy='median')
 imp_median.fit(X_train)
 X_test_median = imp_median.transform(X_test_masked)
@@ -305,6 +371,13 @@ imputation_quality_data.append({'Model': 'Baseline (Median)', 'Metric': 'MAE', '
 imputation_quality_data.append({'Model': 'Baseline (Median)', 'Metric': 'R2 Score', 'Value': r2_median})
 
 print(f"Baseline (Median): AUC={base_stats['auc']:.4f} | R2_Imp={r2_median:.4f} | MAE_Imp={mae_median:.4f}")
+
+best_imputation_auc = 0
+best_imputation_model_name = ""
+best_imputation_pipeline = None
+
+# Dictionary to store pipelines for all imputed models
+imputed_pipelines = {}
 
 # Loop through Advanced Imputers
 for imp_name, imp_estimator in IMPUTATION_MODELS:
@@ -342,7 +415,31 @@ for imp_name, imp_estimator in IMPUTATION_MODELS:
         pipeline_adv.fit(X_train, y_train)
         stats = get_metrics_tuned(pipeline_adv, X_test, y_test)
         imputation_results[imp_name] = stats
+        imputed_pipelines[imp_name] = pipeline_adv # Store pipeline for later use (e.g., confusion matrix)
         print(f"  -> Classification: AUC={stats['auc']:.4f} | Recall={stats['recall']:.4f}")
+
+        if stats['auc'] > best_imputation_auc:
+            best_imputation_auc = stats['auc']
+            best_imputation_model_name = imp_name
+            best_imputation_pipeline = pipeline_adv # Store best pipeline for confusion matrix
+
+        # SAVE CM DATA
+        tn, fp, fn, tp = confusion_matrix(y_test, stats['y_pred']).ravel()
+        all_cm_data.append({
+            'Model': imp_name,
+            'Phase': 'Phase 2',
+            'TN': tn, 'FP': fp, 'FN': fn, 'TP': tp
+        })
+
+        # SAVE ROC DATA
+        roc_df = pd.DataFrame()
+        fpr, tpr, _ = roc_curve(y_test, stats['y_prob'])
+        roc_df['FPR'] = fpr
+        roc_df['TPR'] = tpr
+        roc_df['Model'] = imp_name
+        roc_df['Phase'] = 'Phase 2'
+        roc_df['AUC'] = stats['auc']
+        all_roc_data.append(roc_df)
         
     except Exception as e:
         print(f"  -> Failed: {e}")
@@ -393,6 +490,31 @@ for name, res in imputation_results.items():
 # Save Final Classification Results to CSV
 final_results_df = pd.DataFrame(final_results_data)
 final_results_df.to_csv(os.path.join(RESULTS_DIR, 'final_classification_comparison.csv'), index=False)
+
+# Generate and Save Confusion Matrix Plot for ALL Imputed Models
+for name, pipeline in imputed_pipelines.items():
+    # Use F2 tuned prediction from results
+    y_pred_imputed = imputation_results[name]['y_pred']
+    cm_imputed = confusion_matrix(y_test, y_pred_imputed)
+
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm_imputed, annot=True, fmt='d', cmap='Blues',
+                xticklabels=['Predicted Survival', 'Predicted Death'],
+                yticklabels=['Actual Survival', 'Actual Death'])
+    plt.title(f'Confusion Matrix - Imputation ({name})')
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, f'confusion_matrix_imputed_{name.replace(" ", "_")}.png'))
+    plt.close()
+
+# SAVE ALL CONFUSION MATRICES TO CSV
+all_cm_df = pd.DataFrame(all_cm_data)
+all_cm_df.to_csv(os.path.join(RESULTS_DIR, 'confusion_matrices.csv'), index=False)
+print(f"\nSaved all confusion matrices to: {os.path.join(RESULTS_DIR, 'confusion_matrices.csv')}")
+
+# EXPORT ALL ROC DATA
+all_roc_df = pd.concat(all_roc_data, ignore_index=True)
+all_roc_df.to_csv(os.path.join(RESULTS_DIR, 'all_roc_curves.csv'), index=False)
+print(f"\nSaved all ROC curve data to: {os.path.join(RESULTS_DIR, 'all_roc_curves.csv')}")
 
 # PLOT 5: Classification ROC Comparison
 plt.figure(figsize=(12, 10))
