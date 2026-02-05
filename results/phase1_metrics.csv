@@ -1,0 +1,13 @@
+Model,Metric,Value
+Decision Tree,Accuracy,0.6522222222222223
+Decision Tree,Precision,0.2146118721461187
+Decision Tree,Recall,0.5617529880478087
+Random Forest,Accuracy,0.7811111111111111
+Random Forest,Precision,0.29971988795518206
+Random Forest,Recall,0.4262948207171315
+Hist Gradient Boosting,Accuracy,0.6733333333333333
+Hist Gradient Boosting,Precision,0.24508320726172467
+Hist Gradient Boosting,Recall,0.6454183266932271
+Logistic Regression,Accuracy,0.665
+Logistic Regression,Precision,0.24269005847953215
+Logistic Regression,Recall,0.6613545816733067

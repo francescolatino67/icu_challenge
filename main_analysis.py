@@ -1,144 +1,122 @@
 import pandas as pd
-import seaborn as sns
-import matplotlib.pyplot as plt
 import numpy as np
-
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os # Added for directory creation
 from sklearn.model_selection import train_test_split, RandomizedSearchCV
 from sklearn.preprocessing import StandardScaler
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier, VotingClassifier
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.impute import SimpleImputer
+from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, HistGradientBoostingClassifier, VotingClassifier, ExtraTreesRegressor
+from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+from sklearn.linear_model import LogisticRegression, BayesianRidge
+# REQUIRED: Must be imported before IterativeImputer
+from sklearn.experimental import enable_iterative_imputer 
+from sklearn.impute import SimpleImputer, IterativeImputer
 from sklearn.pipeline import Pipeline
-from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc, accuracy_score, precision_recall_curve
+from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score, roc_curve, auc, accuracy_score, recall_score, precision_score, precision_recall_curve, mean_absolute_error, r2_score
 from sklearn.inspection import permutation_importance
 
-# Define the path to the dataset
-file_path = r'..\icu_challenge\Dataset_ICU_Barbieri_Mollura.csv'
+# --- CONFIGURATION ---
+FILE_PATH = 'Dataset_ICU_Barbieri_Mollura.csv'
+RANDOM_STATE = 42
+RESULTS_DIR = 'results' # Directory to save results
 
-# Load the dataset
+# Create results directory if it doesn't exist
+if not os.path.exists(RESULTS_DIR):
+    os.makedirs(RESULTS_DIR)
+
+# --- LOAD DATA ---
 try:
-    df = pd.read_csv(file_path)
+    df = pd.read_csv(FILE_PATH)
     print("Dataset loaded successfully.")
 except FileNotFoundError:
-    print(f"Error: File '{file_path}' not found. Please check the file name and path.")
+    print(f"Error: File '{FILE_PATH}' not found.")
     exit()
 
-# --- Data Preprocessing: Clinical "First 30 Minutes" Filtering ---
-# GOAL: Retain ONLY variables available immediately at admission (Triage/Monitor).
-# EXCLUDE: Laboratory results (require time to process).
+# ==============================================================================
+# 1. DATA PREPROCESSING & CLINICAL FILTERING
+# ==============================================================================
+print("\n[1] Applying Clinical Filter (First 30 Minutes)...")
 
-print("\n--- Applying Clinical Filter (First 30 Minutes: Monitor + Demographics ONLY) ---")
-
-# 1. Define Immediate Variables (Demographics + Unit)
-demographics_and_units = ['Age', 'Gender', 'Height', 'Weight', 'CCU', 'CSRU', 'SICU', 'In-hospital_death', 'recordid']
-
-# 2. Identify potential admission columns ('_first')
+# A. Define Variables to Keep
+demographics_and_units = ['Age', 'Gender', 'Height', 'Weight', 'CCU', 'CSRU', 'SICU', 'In-hospital_death']
 all_first_cols = [c for c in df.columns if c.endswith('_first')]
 
-# 3. Define Laboratory Keywords to EXCLUDE
-# These measurements typically take > 30 mins (Blood work, Gases, Chemistries)
+# B. Define Laboratory Keywords to EXCLUDE
 lab_keywords = [
     'Albumin', 'ALP', 'ALT', 'AST', 'Bilirubin', 'BUN', 'Cholesterol', 'Creatinine', # Chemistry
-    'HCT', 'K', 'Lactate', 'Mg', 'Na', # Blood Gas / Electrolytes
-    'Platelets', 'TroponinI', 'TroponinT', 'WBC', 'Glucose' # Heme / Cardiac / Others
+    'HCT', 'K', 'Lactate', 'Mg', 'Na', # Electrolytes
+    'Platelets', 'TroponinI', 'TroponinT', 'WBC', 'Glucose', 'PaO2', 'PaCO2', 'pH', 'FiO2', 'HCO3' # Gases/Heme
 ]
 
-# Split '_first' columns into Vitals (Keep) and Labs (Drop)
 vitals_to_keep = []
-labs_dropped = []
-
 for col in all_first_cols:
-    is_lab = False
-    for lab_key in lab_keywords:
-        if lab_key in col:
-            is_lab = True
-            break
-    
-    if is_lab:
-        labs_dropped.append(col)
-    else:
+    if not any(lab_key in col for lab_key in lab_keywords):
         vitals_to_keep.append(col)
 
-print(f"\nExcluding {len(labs_dropped)} laboratory features (unlikely available in 30 mins):")
-print(labs_dropped)
-print(f"\nRetaining {len(vitals_to_keep)} bedside/monitor features:")
-print(vitals_to_keep)
-
-# Combine Demographics + Vitals
+# C. Construct Final Dataset
 final_cols = demographics_and_units + vitals_to_keep
-df_immediate = df[final_cols].copy()
+df_triage = df[final_cols].copy()
+print(f"Features Retained: {df_triage.shape[1]-1} (Excluding Target)")
 
-print(f"\nFinal Feature Count: {df_immediate.shape[1]}")
+# D. Feature Engineering (GCS)
+# We use dummy_na=False because we want the Imputer to FILL these later.
+if 'GCS_first' in df_triage.columns:
+    df_triage = pd.get_dummies(df_triage, columns=['GCS_first'], drop_first=True, dummy_na=False)
 
-# --- Feature Engineering: One-Hot Encoding Clinical Scores ---
-# CLINICAL NOTE: Only GCS_first remains as a score available in 30 mins.
-# We use dummy_na=True to preserve 'NaN' information.
+# E. Correlation Analysis & Pruning
+print("\n[2] Computing Correlation Matrix...")
+X_temp = df_triage.drop(columns=['In-hospital_death'])
+corr_matrix = X_temp.corr().abs()
 
-cols_to_encode = ['GCS_first']
-cols_to_encode = [c for c in cols_to_encode if c in df_immediate.columns]
+# PLOT 1: Correlation Matrix (Before Pruning)
+plt.figure(figsize=(16, 12))
+sns.heatmap(corr_matrix, annot=False, cmap='coolwarm', linewidths=0.5)
+plt.title('Correlation Matrix (Triage Variables - Before Pruning)')
+plt.tight_layout()
+plt.savefig(os.path.join(RESULTS_DIR, 'correlation_matrix_pre_pruning.png')) # Save plot
+plt.show()
 
-if cols_to_encode:
-    print(f"\nOne-Hot Encoding with NaN preservation: {cols_to_encode}")
-    df_encoded = pd.get_dummies(df_immediate, columns=cols_to_encode, drop_first=True, dummy_na=True)
-else:
-    df_encoded = df_immediate.copy()
-
-# --- Data Preprocessing: Objective Correlation Pruning ---
-print("\nComputing correlation matrix for admission variables...")
-numeric_df = df_encoded.select_dtypes(include=[np.number])
-corr_matrix = numeric_df.corr().abs()
-
-# Identify Highly Correlated Pairs (> 0.95)
-threshold = 0.95
+# Pruning > 0.95
+print("Pruning High Correlations (>0.95)...")
 upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-cols_to_drop_corr = [column for column in upper.columns if any(upper[column] > threshold)]
+to_drop = [column for column in upper.columns if any(upper[column] > 0.95)]
+df_triage = df_triage.drop(columns=to_drop)
+print(f"Dropped {len(to_drop)} redundant features: {to_drop}")
 
-print(f"\nHighly correlated columns detected (> {threshold}): {len(cols_to_drop_corr)}")
-print(f"Dropping: {cols_to_drop_corr}")
+# F. Train/Test Split
+X = df_triage.drop(columns=['In-hospital_death'])
+y = df_triage['In-hospital_death']
 
-df_cleaned = df_encoded.drop(columns=cols_to_drop_corr, errors='ignore')
+# Clean split
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=RANDOM_STATE, stratify=y)
+print(f"Train Size: {X_train.shape[0]} | Test Size: {X_test.shape[0]}")
 
-# --- Remove columns with excessive missingness ---
-def remove_high_missing_cols(df, threshold=95): 
-    total = len(df)
-    cols_to_drop = [col for col in df.columns if (df[col].isnull().sum() / total * 100) > threshold]
-    if cols_to_drop:
-        print(f"Dropping columns with >{threshold}% missing values: {cols_to_drop}")
-    return df.drop(columns=cols_to_drop)
 
-df_cleaned_noNANs = remove_high_missing_cols(df_cleaned)
+# ==============================================================================
+# 2. PHASE 1: BASELINE MODEL SELECTION & TUNING
+# Strategy: Median Imputation + Missing Indicators
+# ==============================================================================
+print("\n" + "="*60)
+print(" PHASE 1: BASELINE MODEL SELECTION (Median + Missing Flags)")
+print("="*60)
 
-# Define X and y
-if 'recordid' in df_cleaned_noNANs.columns:
-    X = df_cleaned_noNANs.drop(columns=['In-hospital_death', 'recordid'])
-else:
-    X = df_cleaned_noNANs.drop(columns=['In-hospital_death'])
-
-y = df_cleaned_noNANs['In-hospital_death']
-
-# Train-Test Split (Preserving NaNs)
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42, stratify=y)
-
-# --- Hyperparameter Grids & Model Pipelines ---
-
-model_params = {
+# Define Model Pipelines (All use SimpleImputer(add_indicator=True))
+model_configs = {
     "Decision Tree": {
         "model": Pipeline([
             ('imputer', SimpleImputer(strategy='median', add_indicator=True)),
-            ('classifier', DecisionTreeClassifier(random_state=42, class_weight='balanced'))
+            ('classifier', DecisionTreeClassifier(random_state=RANDOM_STATE, class_weight='balanced'))
         ]),
         "params": {
             "classifier__max_depth": [None, 10, 20],
-            "classifier__min_samples_split": [2, 10],
             "classifier__min_samples_leaf": [1, 5]
         }
     },
     "Random Forest": {
         "model": Pipeline([
             ('imputer', SimpleImputer(strategy='median', add_indicator=True)),
-            ('classifier', RandomForestClassifier(random_state=42, class_weight='balanced'))
+            ('classifier', RandomForestClassifier(random_state=RANDOM_STATE, class_weight='balanced'))
         ]),
         "params": {
             "classifier__n_estimators": [100, 200],
@@ -146,246 +124,288 @@ model_params = {
             "classifier__min_samples_leaf": [1, 4]
         }
     },
-    "k-Nearest Neighbors": {
+    "Hist Gradient Boosting": {
         "model": Pipeline([
             ('imputer', SimpleImputer(strategy='median', add_indicator=True)),
-            ('scaler', StandardScaler()), 
-            ('classifier', KNeighborsClassifier())
+            ('classifier', HistGradientBoostingClassifier(random_state=RANDOM_STATE, class_weight='balanced'))
         ]),
         "params": {
-            "classifier__n_neighbors": [5, 9, 15],
-            "classifier__weights": ['uniform', 'distance']
-        }
-    },
-    "Hist Gradient Boosting": {
-        "model": HistGradientBoostingClassifier(random_state=42, class_weight='balanced'),
-        "params": {
-            "learning_rate": [0.01, 0.1],
-            "max_depth": [None, 10, 20],
-            "min_samples_leaf": [20, 40]
+            "classifier__learning_rate": [0.01, 0.1],
+            "classifier__max_depth": [None, 10, 20]
         }
     },
     "Logistic Regression": {
         "model": Pipeline([
             ('imputer', SimpleImputer(strategy='median', add_indicator=True)), 
             ('scaler', StandardScaler()), 
-            ('classifier', LogisticRegression(random_state=42, max_iter=2000, class_weight='balanced'))
+            ('classifier', LogisticRegression(random_state=RANDOM_STATE, max_iter=2000, class_weight='balanced'))
         ]),
         "params": {
             "classifier__C": np.logspace(-3, 2, 10),
-            "classifier__penalty": ['l1', 'l2'],
             "classifier__solver": ['liblinear', 'saga'] 
         }
     }
 }
 
-results = {}
-best_estimators = {} 
 best_auc = 0
 best_model_name = ""
-best_model_obj = None
+best_model_estimator = None 
+phase1_metrics_data = [] # To store dicts for DataFrame
+phase1_roc_data = {}
 
-print("\n\n=======================================================")
-print(" STARTING MODEL TRAINING (TRIAGE MODE)")
-print(" Strategy: Native Support (HGB) vs Missing Indicator (RF, DT, LR, KNN)")
-print("=======================================================")
-
-# Train and evaluate individual models
-for model_name, config in model_params.items():
-    print(f"\n\n-----------------------------------")
-    print(f"--- {model_name} ---")
-    print(f"-----------------------------------")
-
-    model = config["model"]
-    params = config["params"]
-
-    print("Running RandomizedSearchCV...")
+# Hyperparameter Tuning Loop
+for name, config in model_configs.items():
+    print(f"Tuning {name}...")
     rs = RandomizedSearchCV(
-        model, 
-        params, 
-        n_iter=10, 
-        cv=5, 
-        scoring='roc_auc', 
-        n_jobs=-1, 
-        random_state=42,
-        verbose=0
+        config["model"], config["params"], 
+        n_iter=10, cv=5, scoring='roc_auc', 
+        n_jobs=-1, random_state=RANDOM_STATE, verbose=0
     )
-    
     rs.fit(X_train, y_train)
     
-    best_model = rs.best_estimator_
-    best_estimators[model_name] = best_model
+    # Store results
+    y_prob = rs.best_estimator_.predict_proba(X_test)[:, 1]
+    y_pred = rs.best_estimator_.predict(X_test)
     
-    print(f"Best Parameters: {rs.best_params_}")
-    print(f"Best CV ROC-AUC: {rs.best_score_:.4f}")
+    auc_score = roc_auc_score(y_test, y_prob)
+    acc_score = accuracy_score(y_test, y_pred)
+    prec_score = precision_score(y_test, y_pred)
+    rec_score = recall_score(y_test, y_pred)
+    
+    # Save Metrics for Plotting
+    phase1_metrics_data.append({'Model': name, 'Metric': 'Accuracy', 'Value': acc_score})
+    phase1_metrics_data.append({'Model': name, 'Metric': 'Precision', 'Value': prec_score})
+    phase1_metrics_data.append({'Model': name, 'Metric': 'Recall', 'Value': rec_score})
+    
+    # Save ROC Data
+    fpr, tpr, _ = roc_curve(y_test, y_prob)
+    phase1_roc_data[name] = (fpr, tpr, auc_score)
+    
+    print(f"  -> Best AUC: {auc_score:.4f} | Recall: {rec_score:.4f} | Accuracy: {acc_score:.4f}")
+    
+    if auc_score > best_auc:
+        best_auc = auc_score
+        best_model_name = name
+        best_model_estimator = rs.best_estimator_
 
-    y_pred_proba = best_model.predict_proba(X_test)[:, 1]
+print(f"\n🏆 CHAMPION MODEL (BASELINE): {best_model_name} (AUC={best_auc:.4f})")
 
-    # Threshold Tuning (F2 Score)
-    precision, recall, thresholds = precision_recall_curve(y_test, y_pred_proba)
-    numerator = (1 + 2**2) * precision * recall
-    denominator = (2**2 * precision) + recall
-    f2_scores = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator!=0)
-    
-    ix = np.argmax(f2_scores[:-1])
-    best_thresh = thresholds[ix]
-    
-    print(f"Optimal Threshold (Max F2): {best_thresh:.4f}")
+# Save Phase 1 Metrics to CSV
+metrics_df = pd.DataFrame(phase1_metrics_data)
+metrics_df.to_csv(os.path.join(RESULTS_DIR, 'phase1_metrics.csv'), index=False)
 
-    y_pred = (y_pred_proba >= best_thresh).astype(int)
+# PLOT 2: Phase 1 Metrics Comparison (Bar Chart)
+plt.figure(figsize=(12, 6))
+sns.barplot(data=metrics_df, x='Model', y='Value', hue='Metric', palette='viridis')
+plt.title('Phase 1: Model Performance Comparison (Default Threshold)')
+plt.ylim(0, 1.05)
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.tight_layout()
+plt.savefig(os.path.join(RESULTS_DIR, 'phase1_metrics_comparison.png')) # Save plot
+plt.show()
 
-    fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
-    roc_auc = auc(fpr, tpr)
-    
-    # Track Best Model
-    if roc_auc > best_auc:
-        best_auc = roc_auc
-        best_model_name = model_name
-        best_model_obj = best_model
-
-    results[model_name] = {
-        "y_pred": y_pred, 
-        "y_pred_proba": y_pred_proba, 
-        "fpr": fpr, 
-        "tpr": tpr, 
-        "roc_auc": roc_auc
-    }
-
-# --- IMPLEMENTING SOFT VOTING ENSEMBLE ---
-if "Random Forest" in best_estimators and "Logistic Regression" in best_estimators:
-    print("\n\n-----------------------------------")
-    print("--- Voting Ensemble (RF + LR) ---")
-    print("-----------------------------------")
-    
-    ensemble_model = VotingClassifier(
-        estimators=[
-            ('rf', best_estimators['Random Forest']), 
-            ('lr', best_estimators['Logistic Regression'])
-        ],
-        voting='soft'
-    )
-    
-    ensemble_model.fit(X_train, y_train)
-    
-    y_pred_proba_ens = ensemble_model.predict_proba(X_test)[:, 1]
-    
-    # Tune Threshold
-    precision, recall, thresholds = precision_recall_curve(y_test, y_pred_proba_ens)
-    numerator = (1 + 2**2) * precision * recall
-    denominator = (2**2 * precision) + recall
-    f2_scores = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator!=0)
-    
-    ix = np.argmax(f2_scores[:-1])
-    best_thresh_ens = thresholds[ix]
-    
-    print(f"Optimal Ensemble Threshold (Max F2): {best_thresh_ens:.4f}")
-    
-    y_pred_ens = (y_pred_proba_ens >= best_thresh_ens).astype(int)
-    
-    fpr, tpr, _ = roc_curve(y_test, y_pred_proba_ens)
-    roc_auc = auc(fpr, tpr)
-    
-    # Check if Ensemble is best
-    if roc_auc > best_auc:
-        best_auc = roc_auc
-        best_model_name = "Ensemble (RF+LR)"
-        best_model_obj = ensemble_model
-
-    results["Ensemble (RF+LR)"] = {
-        "y_pred": y_pred_ens,
-        "y_pred_proba": y_pred_proba_ens,
-        "fpr": fpr,
-        "tpr": tpr,
-        "roc_auc": roc_auc
-    }
-    
-    conf_matrix = confusion_matrix(y_test, y_pred_ens)
-    print("Confusion Matrix (Ensemble) [Tuned]:")
-    print(conf_matrix)
-    
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues',
-                xticklabels=['Predicted Not-Died', 'Predicted Died'],
-                yticklabels=['Actual Not-Died', 'Actual Died'])
-    plt.title(f'Ensemble (RF+LR) - CM (Thresh={best_thresh_ens:.2f})')
-    plt.show()
-
-    print("\nClassification Report (Ensemble):")
-    print(classification_report(y_test, y_pred_ens, target_names=['Not-Died (0)', 'Died (1)']))
-    
-    print(f"\nAccuracy (Ensemble): {accuracy_score(y_test, y_pred_ens):.4f}")
-
-
-# --- Combined ROC Curve ---
-print("\n\n-----------------------------------")
-print("--- Model Comparison (Optimized) ---")
-print("-----------------------------------")
-plt.figure(figsize=(12, 10))
-colors = {
-    'Decision Tree': 'darkorange',
-    'Random Forest': 'green', 
-    'k-Nearest Neighbors': 'purple',
-    'Hist Gradient Boosting': 'teal',
-    'Logistic Regression': 'blue',
-    'Ensemble (RF+LR)': 'black'
-}
-
-for model_name, res in results.items():
-    color = colors.get(model_name, 'gray')
-    plt.plot(res["fpr"], res["tpr"], color=color, lw=2, label=f'{model_name} ROC (area = {res["roc_auc"]:.2f})')
-
-plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+# PLOT 3: Phase 1 ROC Curves Comparison
+plt.figure(figsize=(10, 8))
+colors = ['blue', 'green', 'orange', 'purple']
+for (name, (fpr, tpr, roc_auc)), color in zip(phase1_roc_data.items(), colors):
+    plt.plot(fpr, tpr, label=f'{name} (AUC = {roc_auc:.3f})', lw=2, color=color)
+plt.plot([0, 1], [0, 1], 'k--', lw=2)
 plt.xlim([0.0, 1.0])
 plt.ylim([0.0, 1.05])
 plt.xlabel('False Positive Rate')
 plt.ylabel('True Positive Rate')
-plt.title('Comparison of ROC Curves (All Models NaN-Aware)')
+plt.title('Phase 1: ROC Curves Comparison')
 plt.legend(loc="lower right")
+plt.grid(True, alpha=0.3)
+plt.savefig(os.path.join(RESULTS_DIR, 'phase1_roc_curves.png')) # Save plot
 plt.show()
 
-# --- FEATURE IMPORTANCE ANALYSIS (BEST MODEL) ---
-print(f"\n\n=======================================================")
-print(f" BEST MODEL IDENTIFIED: {best_model_name}")
-print(f" ROC AUC: {best_auc:.4f}")
-print("=======================================================")
-
-print(f"\nCalculating Permutation Importance for {best_model_name}...")
-print("This explains 'weights' by shuffling each feature and measuring AUC drop.")
-
-# Permutation importance works for ALL models (Pipeline, Ensemble, etc.)
-# It uses the Test Set to ensure we are measuring generalization importance.
+# Feature Importance
+print(f"\n[Analysis] Calculating Feature Importance for {best_model_name}...")
 r = permutation_importance(
-    best_model_obj, 
-    X_test, 
-    y_test,
-    n_repeats=10,
-    random_state=42,
-    n_jobs=-1,
-    scoring='roc_auc'
+    best_model_estimator, X_test, y_test,
+    n_repeats=10, random_state=RANDOM_STATE, n_jobs=-1, scoring='roc_auc'
 )
+sorted_idx = r.importances_mean.argsort()[::-1][:15]
 
-# Create a DataFrame for visualization
-importances_df = pd.DataFrame({
-    'Feature': X.columns,
-    'Importance Mean': r.importances_mean,
-    'Importance Std': r.importances_std
+# Save Feature Importance to CSV
+fi_df = pd.DataFrame({
+    'Feature': X_test.columns[sorted_idx],
+    'Importance Mean': r.importances_mean[sorted_idx],
+    'Importance Std': r.importances_std[sorted_idx]
 })
+fi_df.to_csv(os.path.join(RESULTS_DIR, f'feature_importance_{best_model_name.replace(" ", "_")}.csv'), index=False)
 
-# Sort by importance
-importances_df = importances_df.sort_values(by='Importance Mean', ascending=False).head(20)
-
-print("\nTop 10 Important Features:")
-print(importances_df[['Feature', 'Importance Mean']].head(10))
-
-# Plotting Boxplot
-plt.figure(figsize=(12, 8))
-# Re-create raw data structure for boxplot
-top_indices = r.importances_mean.argsort()[::-1][:20]
-top_features = X.columns[top_indices]
-top_importances = r.importances[top_indices].T
-
-plt.boxplot(top_importances, vert=False, labels=top_features)
-plt.title(f'Permutation Feature Importance ({best_model_name})\n(Metric: Decrease in ROC AUC)')
-plt.xlabel('Decrease in ROC AUC score')
+plt.figure(figsize=(10, 6))
+plt.boxplot(r.importances[sorted_idx].T, vert=False, labels=X_test.columns[sorted_idx])
+plt.title(f"Permutation Importance ({best_model_name})")
+plt.xlabel("Decrease in ROC AUC Score")
 plt.tight_layout()
+plt.savefig(os.path.join(RESULTS_DIR, f'feature_importance_{best_model_name.replace(" ", "_")}.png')) # Save plot
+plt.show()
+
+# ==============================================================================
+# 3. PHASE 2: ADVANCED IMPUTATION BENCHMARK
+# Strategy: Compare different regressors for IterativeImputer with Best Classifier
+# Metrics: Reconstruction Error (R2, MAE) AND Classification Performance
+# ==============================================================================
+print("\n" + "="*60)
+print(f" PHASE 2: IMPUTATION STRATEGY BENCHMARK")
+print(f" Engine: {best_model_name}")
+print("="*60)
+
+# Define Imputation Models to Compare
+IMPUTATION_MODELS = [
+    ("BayesianRidge", None),  # Default
+    ("DecisionTree", DecisionTreeRegressor(max_depth=10, random_state=RANDOM_STATE)),
+    ("RandomForest", RandomForestRegressor(n_estimators=20, max_depth=10, n_jobs=-1, random_state=RANDOM_STATE)),
+    ("ExtraTrees", ExtraTreesRegressor(n_estimators=20, max_depth=10, n_jobs=-1, random_state=RANDOM_STATE)),
+    ("KNN", KNeighborsRegressor(n_neighbors=5, weights='distance', n_jobs=-1)),
+]
+
+imputation_results = {}
+imputation_quality_data = [] # To store R2/MAE
+
+# 1. Validation Logic for Imputation Quality
+# We mask known values in the Test set to calculate MAE/R2 of the imputation itself
+X_test_val = X_test.copy().astype(float) # Cast to float to avoid object errors
+# Create mask for 10% of observed values
+np.random.seed(RANDOM_STATE)
+mask = np.random.choice([True, False], size=X_test_val.shape, p=[0.1, 0.9])
+# Only mask values that are NOT already NaN
+mask = mask & (~np.isnan(X_test_val.values))
+X_test_masked = X_test_val.mask(mask)
+ground_truth = X_test_val.values[mask]
+
+# Baseline Stats (Classification)
+def get_metrics_tuned(pipeline, X, y):
+    y_prob = pipeline.predict_proba(X)[:, 1]
+    precision, recall, thresholds = precision_recall_curve(y, y_prob)
+    f2_scores = np.divide((1 + 4) * precision * recall, (4 * precision) + recall, out=np.zeros_like(precision), where=((4 * precision) + recall)!=0)
+    ix = np.argmax(f2_scores[:-1])
+    thresh = thresholds[ix]
+    y_pred = (y_prob >= thresh).astype(int)
+    return {
+        "auc": roc_auc_score(y, y_prob),
+        "recall": recall_score(y, y_pred),
+        "accuracy": accuracy_score(y, y_pred),
+        "y_prob": y_prob
+    }
+
+base_stats = get_metrics_tuned(best_model_estimator, X_test, y_test)
+imputation_results["Baseline (Median)"] = base_stats
+# Note: Baseline Median imputation MAE/R2 is not calculated via iterative logic, but we can impute median for plot
+imp_median = SimpleImputer(strategy='median')
+imp_median.fit(X_train)
+X_test_median = imp_median.transform(X_test_masked)
+preds_median = X_test_median[mask]
+mae_median = mean_absolute_error(ground_truth, preds_median)
+r2_median = r2_score(ground_truth, preds_median)
+imputation_quality_data.append({'Model': 'Baseline (Median)', 'Metric': 'MAE', 'Value': mae_median})
+imputation_quality_data.append({'Model': 'Baseline (Median)', 'Metric': 'R2 Score', 'Value': r2_median})
+
+print(f"Baseline (Median): AUC={base_stats['auc']:.4f} | R2_Imp={r2_median:.4f} | MAE_Imp={mae_median:.4f}")
+
+# Loop through Advanced Imputers
+for imp_name, imp_estimator in IMPUTATION_MODELS:
+    print(f"Evaluating Imputer: {imp_name}...")
+    
+    # A. Train Imputer
+    advanced_imputer = IterativeImputer(
+        estimator=imp_estimator, max_iter=10, random_state=RANDOM_STATE, initial_strategy='median'
+    )
+    advanced_imputer.fit(X_train)
+    
+    # B. Calculate Imputation Quality (R2/MAE) on Masked Data
+    X_test_imputed_val = advanced_imputer.transform(X_test_masked)
+    preds_val = X_test_imputed_val[mask]
+    mae_val = mean_absolute_error(ground_truth, preds_val)
+    r2_val = r2_score(ground_truth, preds_val)
+    
+    imputation_quality_data.append({'Model': imp_name, 'Metric': 'MAE', 'Value': mae_val})
+    imputation_quality_data.append({'Model': imp_name, 'Metric': 'R2 Score', 'Value': r2_val})
+    print(f"  -> Imputation Quality: R2={r2_val:.4f} | MAE={mae_val:.4f}")
+
+    # C. Train & Evaluate Downstream Classifier
+    # Reconstruct Pipeline
+    steps = []
+    steps.append(('imputer', advanced_imputer)) # Use the fitted imputer (or re-fit in pipeline)
+    if 'scaler' in best_model_estimator.named_steps:
+        steps.append(('scaler', StandardScaler()))
+    classifier_instance = best_model_estimator.named_steps['classifier']
+    steps.append(('classifier', classifier_instance))
+    
+    pipeline_adv = Pipeline(steps)
+    
+    try:
+        # Fit classification pipeline (refits imputer on X_train naturally)
+        pipeline_adv.fit(X_train, y_train)
+        stats = get_metrics_tuned(pipeline_adv, X_test, y_test)
+        imputation_results[imp_name] = stats
+        print(f"  -> Classification: AUC={stats['auc']:.4f} | Recall={stats['recall']:.4f}")
+        
+    except Exception as e:
+        print(f"  -> Failed: {e}")
+
+# Save Imputation Quality Metrics to CSV
+imp_qual_df = pd.DataFrame(imputation_quality_data)
+imp_qual_df.to_csv(os.path.join(RESULTS_DIR, 'imputation_quality_metrics.csv'), index=False)
+
+# PLOT 4: Imputation Quality Comparison (R2 and MAE)
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+# MAE Plot
+sns.barplot(data=imp_qual_df[imp_qual_df['Metric']=='MAE'], x='Model', y='Value', ax=axes[0], palette='magma')
+axes[0].set_title('Imputation Error (MAE) - Lower is Better')
+axes[0].tick_params(axis='x', rotation=45)
+
+# R2 Plot
+sns.barplot(data=imp_qual_df[imp_qual_df['Metric']=='R2 Score'], x='Model', y='Value', ax=axes[1], palette='viridis')
+axes[1].set_title('Imputation Accuracy (R2 Score) - Higher is Better')
+axes[1].tick_params(axis='x', rotation=45)
+
+plt.tight_layout()
+plt.savefig(os.path.join(RESULTS_DIR, 'imputation_quality_comparison.png')) # Save plot
+plt.show()
+
+# ==============================================================================
+# 4. FINAL CLASSIFICATION COMPARISON
+# ==============================================================================
+print("\n" + "="*80)
+print(f" FINAL RESULTS: IMPUTATION STRATEGY CLASSIFICATION IMPACT ({best_model_name})")
+print("="*80)
+print(f"{'Strategy':<20} | {'AUC':<10} | {'Recall (F2)':<15} | {'Accuracy':<10} | {'Diff vs Base'}")
+print("-" * 80)
+
+final_results_data = [] # For CSV
+
+for name, res in imputation_results.items():
+    diff = res['auc'] - base_stats['auc']
+    print(f"{name:<20} | {res['auc']:<10.4f} | {res['recall']:<15.4f} | {res['accuracy']:<10.4f} | {diff:+.4f}")
+    final_results_data.append({
+        'Strategy': name,
+        'AUC': res['auc'],
+        'Recall (F2)': res['recall'],
+        'Accuracy': res['accuracy'],
+        'Diff vs Base': diff
+    })
+
+# Save Final Classification Results to CSV
+final_results_df = pd.DataFrame(final_results_data)
+final_results_df.to_csv(os.path.join(RESULTS_DIR, 'final_classification_comparison.csv'), index=False)
+
+# PLOT 5: Classification ROC Comparison
+plt.figure(figsize=(12, 10))
+colors = ['black', 'blue', 'green', 'purple', 'red', 'orange']
+for (name, res), color in zip(imputation_results.items(), colors):
+    fpr, tpr, _ = roc_curve(y_test, res['y_prob'])
+    plt.plot(fpr, tpr, label=f'{name} (AUC={res["auc"]:.3f})', linewidth=2, color=color)
+
+plt.plot([0, 1], [0, 1], 'k--', alpha=0.3)
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title(f'Impact of Imputation Strategies on Mortality Prediction ({best_model_name})')
+plt.legend(loc="lower right")
+plt.grid(True, alpha=0.3)
+plt.savefig(os.path.join(RESULTS_DIR, 'final_roc_comparison.png')) # Save plot
 plt.show()
